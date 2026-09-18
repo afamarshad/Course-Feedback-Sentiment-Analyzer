@@ -76,6 +76,14 @@ DEVICE = torch.device("cpu")
 
 MAX_LENGTH = 128
 
+# Performance settings for Streamlit Community Cloud.
+# Multilingual DistilBERT can analyze multilingual text directly,
+# so the very large NLLB translation model is NOT loaded automatically.
+AUTO_TRANSLATE_NON_ENGLISH = False
+CSV_MAX_ROWS = 5000
+DISTILBERT_BATCH_SIZE = 16
+TRANSLATION_BATCH_SIZE = 8
+
 # Local Hugging Face translation model.
 # The model is downloaded once from Hugging Face and then
 # cached locally by Transformers. No Google Translate/API
@@ -857,53 +865,60 @@ LANGUAGE_DISPLAY_NAMES = {
 
 
 def detect_feedback_language(text):
-    """
-    Detect the language code used to select the NLLB source
-    language. langdetect is used only for identification;
-    translation itself is performed locally by Hugging Face.
+    """Fast language detection used only when translation is requested.
+
+    Script checks handle common non-Latin languages immediately. For Latin-script
+    languages, langdetect is used as a fallback. English is recognized cheaply
+    when the text contains only common English/Latin characters.
     """
     text = clean_text(text)
-
     if not text:
         return "unknown"
 
-    # Fast character/script checks for languages that are
-    # particularly useful for multilingual course feedback.
-    if re.search(r"[\u0600-\u06FF]", text):
-        # Urdu/Persian/Arabic share Arabic script. langdetect
-        # below can distinguish them when available.
-        pass
-    elif re.search(r"[\u0900-\u097F]", text):
+    if re.search(r"[\u0900-\u097F]", text):
         return "hi"
-    elif re.search(r"[\u0980-\u09FF]", text):
+    if re.search(r"[\u0980-\u09FF]", text):
         return "bn"
-    elif re.search(r"[\u4E00-\u9FFF]", text):
+    if re.search(r"[\u4E00-\u9FFF]", text):
         return "zh"
-    elif re.search(r"[\u3040-\u30FF]", text):
+    if re.search(r"[\u3040-\u30FF]", text):
         return "ja"
-    elif re.search(r"[\uAC00-\uD7AF]", text):
+    if re.search(r"[\uAC00-\uD7AF]", text):
         return "ko"
-    elif re.search(r"[\u0400-\u04FF]", text):
+    if re.search(r"[\u0400-\u04FF]", text):
         return "ru"
+
+    # Arabic-script languages require actual detection because Urdu/Persian/
+    # Arabic share a script.
+    if re.search(r"[\u0600-\u06FF]", text):
+        try:
+            from langdetect import detect
+            detected = detect(text).lower()
+            if detected in NLLB_LANGUAGE_CODES:
+                return detected
+        except Exception:
+            pass
+        return "ur"
+
+    # Cheap English signal. This prevents langdetect from running for most
+    # normal course feedback, which is the common case in this application.
+    words = re.findall(r"[A-Za-z]+", text)
+    if words:
+        common = {"the", "and", "was", "were", "is", "are", "this", "course",
+                  "instructor", "assignment", "assignments", "very", "good",
+                  "great", "excellent", "but", "with", "for", "to", "of", "my"}
+        if len(words) <= 3 or sum(w.lower() in common for w in words) >= 1:
+            return "en"
 
     try:
         from langdetect import detect
-
         detected = detect(text).lower()
-
         if detected in NLLB_LANGUAGE_CODES:
             return detected
-
     except Exception:
         pass
 
-    # Safe fallback for Arabic-script feedback when a language
-    # detector is unavailable.
-    if re.search(r"[\u0600-\u06FF]", text):
-        return "ur"
-
     return "unknown"
-
 
 def language_display_name(code):
     code = str(code).lower()
@@ -960,86 +975,56 @@ def _get_nllb_language_id(tokenizer, language_code):
 
 
 def translate_texts_to_english(texts, source_language):
-    """
-    Translate a list of texts from one detected language to
-    English in a single local Hugging Face generation call.
-    """
-    cleaned_texts = [
-        clean_text(text)
-        for text in texts
-    ]
-
+    """Translate texts in small batches using the lazily loaded NLLB model."""
+    cleaned_texts = [clean_text(text) for text in texts]
     if not cleaned_texts:
         return []
-
     if source_language == "en":
         return cleaned_texts
 
-    source_code = NLLB_LANGUAGE_CODES.get(
-        source_language
-    )
-
+    source_code = NLLB_LANGUAGE_CODES.get(source_language)
     if source_code is None:
         raise ValueError(
-            f"The detected language '{source_language}' "
-            "is not currently mapped to an NLLB language code."
+            f"The detected language '{source_language}' is not mapped to NLLB."
         )
 
-    translation_tokenizer, translation_model = (
-        load_translation_model()
-    )
+    tokenizer, model = load_translation_model()
+    tokenizer.src_lang = source_code
+    target_language_id = _get_nllb_language_id(tokenizer, TRANSLATION_TARGET_LANGUAGE)
 
-    translation_tokenizer.src_lang = source_code
-
-    inputs = translation_tokenizer(
-        cleaned_texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=TRANSLATION_MAX_INPUT_LENGTH
-    )
-
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
-
-    target_language_id = _get_nllb_language_id(
-        translation_tokenizer,
-        TRANSLATION_TARGET_LANGUAGE
-    )
-
-    with torch.no_grad():
-
-        generated_tokens = translation_model.generate(
-            **inputs,
-            forced_bos_token_id=target_language_id,
-            max_length=TRANSLATION_MAX_OUTPUT_LENGTH
+    translated = []
+    for start_idx in range(0, len(cleaned_texts), TRANSLATION_BATCH_SIZE):
+        batch = cleaned_texts[start_idx:start_idx + TRANSLATION_BATCH_SIZE]
+        inputs = tokenizer(
+            batch,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=TRANSLATION_MAX_INPUT_LENGTH
         )
-
-    return [
-        clean_text(value)
-        for value in translation_tokenizer.batch_decode(
-            generated_tokens,
-            skip_special_tokens=True
+        inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                forced_bos_token_id=target_language_id,
+                max_length=TRANSLATION_MAX_OUTPUT_LENGTH
+            )
+        translated.extend(
+            clean_text(x) for x in tokenizer.batch_decode(
+                generated, skip_special_tokens=True
+            )
         )
-    ]
+    return translated
 
 
-def translate_feedback_batch(texts):
+def translate_feedback_batch(texts, force=False):
+    """Detect and translate reviews only when explicitly required.
+
+    This function is intentionally lazy: NLLB is never loaded merely because
+    the app starts. English reviews never load NLLB, and multilingual DistilBERT
+    can be used directly without translation.
     """
-    Detect and translate a collection of reviews.
-
-    English reviews are returned unchanged. Non-English reviews
-    are grouped by source language and translated in batches.
-    This is substantially more suitable for CSV analysis than
-    sending one external API request per review.
-    """
-    cleaned_texts = [
-        clean_text(text)
-        for text in texts
-    ]
-
+    cleaned_texts = [clean_text(text) for text in texts]
     results = [
         {
             "original": text,
@@ -1050,92 +1035,66 @@ def translate_feedback_batch(texts):
         }
         for text in cleaned_texts
     ]
+    if not cleaned_texts:
+        return results
 
     language_groups = {}
-
     for index, text in enumerate(cleaned_texts):
-
         if not text:
             continue
-
-        language = detect_feedback_language(
-            text
-        )
-
+        language = detect_feedback_language(text)
         results[index]["language"] = language
-        results[index]["language_name"] = (
-            language_display_name(language)
-        )
-
+        results[index]["language_name"] = language_display_name(language)
         if language == "en":
-
-            results[index]["translated"] = text
-
-        elif language in NLLB_LANGUAGE_CODES:
-
-            language_groups.setdefault(
-                language,
-                []
-            ).append(index)
-
+            continue
+        if language in NLLB_LANGUAGE_CODES and (force or AUTO_TRANSLATE_NON_ENGLISH):
+            language_groups.setdefault(language, []).append(index)
         else:
-            raise ValueError(
-                "The language of one or more reviews "
-                "could not be mapped to a supported NLLB "
-                "language. Please enter feedback in a "
-                "supported language or use English."
-            )
+            # Preserve the original text. This is important for direct
+            # multilingual DistilBERT inference and prevents NLLB startup.
+            results[index]["language_name"] = language_display_name(language)
 
     for language, indices in language_groups.items():
-
         translated_texts = translate_texts_to_english(
-            [
-                cleaned_texts[index]
-                for index in indices
-            ],
-            language
+            [cleaned_texts[i] for i in indices], language
         )
-
-        for index, translated in zip(
-            indices,
-            translated_texts
-        ):
-
-            results[index]["translated"] = (
-                translated
-            )
+        for index, translated in zip(indices, translated_texts):
+            results[index]["translated"] = translated
             results[index]["was_translated"] = True
 
     return results
 
 
-def prepare_feedback_for_analysis(text):
-    """
-    Prepare one review for the existing English-based
-    sentiment, aspect, and SHAP components.
+def prepare_feedback_for_analysis(text, model_name="Logistic Regression", translate_for_analysis=False):
+    """Prepare feedback according to the selected model.
+
+    DistilBERT is multilingual and therefore analyzes non-English text directly.
+    Logistic Regression and the combined model use the existing English TF-IDF
+    pipeline, so they translate only when translation is requested/needed.
     """
     text = clean_text(text)
-
     if not text:
-        return (
-            "",
-            {
-                "original": "",
-                "translated": "",
-                "language": "unknown",
-                "language_name": "Unknown",
-                "was_translated": False
-            }
-        )
+        return "", {
+            "original": "", "translated": "", "language": "unknown",
+            "language_name": "Unknown", "was_translated": False
+        }
 
-    result = translate_feedback_batch(
-        [text]
-    )[0]
+    detected = detect_feedback_language(text)
+    needs_translation = translate_for_analysis or model_name in {
+        "Logistic Regression", "Combined"
+    }
 
-    return (
-        result["translated"],
-        result
-    )
+    if detected == "en" or not needs_translation:
+        return text, {
+            "original": text,
+            "translated": text,
+            "language": detected,
+            "language_name": language_display_name(detected),
+            "was_translated": False
+        }
+
+    result = translate_feedback_batch([text], force=True)[0]
+    return result["translated"], result
 
 
 # ============================================================
@@ -1335,226 +1294,130 @@ def show_model_loading_error(error):
 # DISTILBERT PREDICTION
 # ============================================================
 
-def predict_distilbert(text):
-
-    text = clean_text(text)
-
-    if not text:
-        return None
-
-    model_tokenizer, model = load_distilbert_model()
-
-    inputs = model_tokenizer(
-        [text],
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=MAX_LENGTH
-    )
-
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
-
-    with torch.no_grad():
-
-        outputs = model(
-            **inputs
-        )
-
-        probabilities = (
-            torch.softmax(
-                outputs.logits,
-                dim=-1
-            )[0]
-            .cpu()
-            .numpy()
-        )
-
+def _prediction_from_probabilities(probabilities):
+    probabilities = np.asarray(probabilities, dtype=float)[:3]
     if len(probabilities) < 3:
-
-        raise ValueError(
-            "The DistilBERT model does not appear "
-            "to be a 3-class sentiment model."
-        )
-
-    probabilities = probabilities[:3]
-
-    prediction_index = int(
-        np.argmax(
-            probabilities
-        )
-    )
-
-    label = LABEL_NAMES.get(
-        prediction_index,
-        "NEUTRAL"
-    )
-
+        raise ValueError("The DistilBERT model does not appear to be a 3-class model.")
+    label = LABEL_NAMES.get(int(np.argmax(probabilities)), "NEUTRAL")
     return {
-
         "label": label,
-
-        "confidence": float(
-            probabilities[
-                prediction_index
-            ]
-        ),
-
+        "confidence": float(probabilities[np.argmax(probabilities)]),
         "probabilities": {
-
-            "NEGATIVE": float(
-                probabilities[0]
-            ),
-
-            "NEUTRAL": float(
-                probabilities[1]
-            ),
-
-            "POSITIVE": float(
-                probabilities[2]
-            )
+            "NEGATIVE": float(probabilities[0]),
+            "NEUTRAL": float(probabilities[1]),
+            "POSITIVE": float(probabilities[2])
         }
     }
 
 
-# ============================================================
-# LOGISTIC REGRESSION PREDICTION
-# ============================================================
+def predict_distilbert_batch(texts, batch_size=DISTILBERT_BATCH_SIZE):
+    cleaned = [clean_text(x) for x in texts]
+    if not cleaned:
+        return []
+    tokenizer, model = load_distilbert_model()
+    outputs = []
+    for start_idx in range(0, len(cleaned), batch_size):
+        batch = cleaned[start_idx:start_idx + batch_size]
+        inputs = tokenizer(
+            batch, return_tensors="pt", padding=True,
+            truncation=True, max_length=MAX_LENGTH
+        )
+        inputs = {key: value.to(DEVICE) for key, value in inputs.items()}
+        with torch.inference_mode():
+            logits = model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()
+        outputs.extend(_prediction_from_probabilities(row) for row in probs)
+    return outputs
 
-def predict_logistic(text):
 
+def predict_distilbert(text):
     text = clean_text(text)
-
     if not text:
         return None
+    return predict_distilbert_batch([text])[0]
 
+
+def predict_logistic_batch(texts):
+    cleaned = [clean_text(x) for x in texts]
+    if not cleaned:
+        return []
     tfidf_model, tfidf_vectorizer = load_tfidf_models()
-
-    vector = (
-        tfidf_vectorizer
-        .transform([text])
-    )
-
-    raw_probabilities = (
-        tfidf_model
-        .predict_proba(vector)[0]
-    )
-
-    probabilities = {
-
-        "NEGATIVE": 0.0,
-        "NEUTRAL": 0.0,
-        "POSITIVE": 0.0
-    }
-
-    for class_value, probability in zip(
-        tfidf_model.classes_,
-        raw_probabilities
-    ):
-
-        label = normalize_label(
-            class_value
-        )
-
-        if label in probabilities:
-
-            probabilities[label] = float(
-                probability
-            )
-
-    label = max(
-        probabilities,
-        key=probabilities.get
-    )
-
-    return {
-
-        "label": label,
-
-        "confidence": probabilities[
-            label
-        ],
-
-        "probabilities": probabilities
-    }
+    vectors = tfidf_vectorizer.transform(cleaned)
+    raw = tfidf_model.predict_proba(vectors)
+    results = []
+    for row in raw:
+        probabilities = {"NEGATIVE": 0.0, "NEUTRAL": 0.0, "POSITIVE": 0.0}
+        for class_value, probability in zip(tfidf_model.classes_, row):
+            label = normalize_label(class_value)
+            if label in probabilities:
+                probabilities[label] = float(probability)
+        label = max(probabilities, key=probabilities.get)
+        results.append({
+            "label": label,
+            "confidence": probabilities[label],
+            "probabilities": probabilities
+        })
+    return results
 
 
-# ============================================================
-# COMBINED PREDICTION
-# ============================================================
+def predict_logistic(text):
+    text = clean_text(text)
+    if not text:
+        return None
+    return predict_logistic_batch([text])[0]
+
 
 def predict_combined(text):
-
-    logistic = predict_logistic(
-        text
-    )
-
-    distilbert = predict_distilbert(
-        text
-    )
-
+    logistic = predict_logistic(text)
+    distilbert = predict_distilbert(text)
     probabilities = {
-
-        label: (
-            logistic["probabilities"][label]
-            +
-            distilbert["probabilities"][label]
-        ) / 2
-
-        for label in [
-            "NEGATIVE",
-            "NEUTRAL",
-            "POSITIVE"
-        ]
+        label: (logistic["probabilities"][label] + distilbert["probabilities"][label]) / 2
+        for label in ["NEGATIVE", "NEUTRAL", "POSITIVE"]
     }
-
-    label = max(
-        probabilities,
-        key=probabilities.get
-    )
-
+    label = max(probabilities, key=probabilities.get)
     return {
-
         "label": label,
-
-        "confidence": probabilities[
-            label
-        ],
-
+        "confidence": probabilities[label],
         "probabilities": probabilities,
-
         "logistic": logistic,
-
         "distilbert": distilbert
     }
 
 
-# ============================================================
-# GENERAL PREDICTION
-# ============================================================
+def predict_combined_batch(texts):
+    logistic_results = predict_logistic_batch(texts)
+    bert_results = predict_distilbert_batch(texts)
+    results = []
+    for logistic, bert in zip(logistic_results, bert_results):
+        probabilities = {
+            label: (logistic["probabilities"][label] + bert["probabilities"][label]) / 2
+            for label in ["NEGATIVE", "NEUTRAL", "POSITIVE"]
+        }
+        label = max(probabilities, key=probabilities.get)
+        results.append({
+            "label": label,
+            "confidence": probabilities[label],
+            "probabilities": probabilities,
+            "logistic": logistic,
+            "distilbert": bert
+        })
+    return results
 
-def predict_sentiment(
-    text,
-    model_name
-):
 
+def predict_sentiment(text, model_name):
     if model_name == "Logistic Regression":
-
-        return predict_logistic(
-            text
-        )
-
+        return predict_logistic(text)
     if model_name == "DistilBERT":
+        return predict_distilbert(text)
+    return predict_combined(text)
 
-        return predict_distilbert(
-            text
-        )
 
-    return predict_combined(
-        text
-    )
+def predict_sentiment_batch(texts, model_name):
+    if model_name == "Logistic Regression":
+        return predict_logistic_batch(texts)
+    if model_name == "DistilBERT":
+        return predict_distilbert_batch(texts)
+    return predict_combined_batch(texts)
 
 
 # ============================================================
@@ -2720,166 +2583,83 @@ def render_sidebar():
 # ============================================================
 
 def render_review_input():
-
-    st.subheader(
-        "  Single Review"
-    )
-
-    left, right = st.columns(
-        [1.15, 2.0]
-    )
+    st.subheader("  Single Review")
+    left, right = st.columns([1.15, 2.0])
 
     with left:
-
-        st.caption(
-            "Select a sample feedback (optional)"
-        )
-
+        st.caption("Select a sample feedback (optional)")
         sample = st.selectbox(
-
             "Feedback example",
-
-            [
-                "Choose a feedback..."
-            ]
-            +
-            list(
-                SAMPLE_FEEDBACK.keys()
-            ),
-
+            ["Choose a feedback..."] + list(SAMPLE_FEEDBACK.keys()),
             label_visibility="collapsed"
         )
-
         if sample != "Choose a feedback...":
-
-            st.session_state.review_text = (
-                SAMPLE_FEEDBACK[sample]
-            )
+            st.session_state.review_text = SAMPLE_FEEDBACK[sample]
 
     with right:
-
-        st.caption(
-            "Type your own review"
-        )
-
+        st.caption("Type your own review")
         review = st.text_area(
-
-            "Course feedback",
-
-            value=(
-                st.session_state.review_text
-            ),
-
-            height=110,
-
-            max_chars=1000,
-
-            placeholder=(
-                "Enter your course feedback here..."
-            ),
-
+            "Course feedback", value=st.session_state.review_text,
+            height=110, max_chars=1000,
+            placeholder="Enter your course feedback here...",
             label_visibility="collapsed"
         )
-
         st.session_state.review_text = review
-
-        st.caption(
-            f"{len(review)}/1000"
-        )
+        st.caption(f"{len(review)}/1000")
 
     compact_divider()
-
-    model_col, recommendation_col, button_col = (
-        st.columns(
-            [1.15, 1.35, 1]
-        )
-    )
+    model_col, recommendation_col, button_col = st.columns([1.15, 1.35, 1])
 
     with model_col:
-
         selected_model = st.radio(
-
             "**Select Model**",
-
-            [
-                "Logistic Regression",
-                "DistilBERT",
-                "Combined"
-            ],
-
-            index=2
+            ["Logistic Regression", "DistilBERT", "Combined"],
+            index=0
         )
 
     with recommendation_col:
-
         st.info(
-            "🔵 **Combined (Recommended)**\n\n"
-            "Uses both Logistic Regression "
-            "and multilingual DistilBERT.\n"
-            "Averages the probability outputs "
-            "of the two trained classifiers and "
-            "is recommended for the final presentation."
+            "⚡ **Fast deployment default**\n\n"
+            "Logistic Regression loads quickly and is ideal for rapid testing. "
+            "Use multilingual DistilBERT for direct multilingual inference. "
+            "Combined runs both models and takes longer on CPU."
         )
 
     with button_col:
-
         st.write("")
         st.write("")
-
         analyze = st.button(
-
-            "Analyze Review",
-
-            icon=":material/search:",
-
-            type="primary",
-
-            use_container_width=True
+            "Analyze Review", icon=":material/search:",
+            type="primary", use_container_width=True
         )
 
     if analyze:
-
         if not clean_text(review):
-
-            st.warning(
-                "Please enter a course review first."
-            )
-
+            st.warning("Please enter a course review first.")
             return
 
-        with st.spinner(
-            "Translating and analyzing review..."
-        ):
-
-            analysis_text, translation = (
-                prepare_feedback_for_analysis(
-                    review
-                )
+        with st.spinner("Analyzing review..."):
+            # Logistic/Combined need English for the existing TF-IDF pipeline.
+            # DistilBERT can process multilingual feedback directly.
+            analysis_text, translation = prepare_feedback_for_analysis(
+                review, selected_model
             )
+            prediction = predict_sentiment(analysis_text, selected_model)
 
-            prediction = predict_sentiment(
-                analysis_text,
-                selected_model
-            )
-
-            aspects = (
-                calculate_aspect_results(
-                    analysis_text
-                )
-            )
+            # Aspect keywords are English-based. Translate only when needed,
+            # and only after the sentiment model has been selected.
+            # Aspect keywords are English-oriented. For multilingual DistilBERT
+            # we keep the analysis fast and avoid silently loading NLLB. The
+            # dedicated Aspect Analysis page can explicitly translate when needed.
+            aspect_text = analysis_text or review
+            aspects = calculate_aspect_results(aspect_text)
 
         st.session_state.single_result = {
-
             "text": review,
-
             "analysis_text": analysis_text,
-
             "translation": translation,
-
             "model": selected_model,
-
             "prediction": prediction,
-
             "aspects": aspects
         }
 
@@ -3649,15 +3429,19 @@ def render_single_review():
         )
 
         st.caption(
-            "Words that influenced the prediction"
+            "Generate the word-level explanation only when needed."
         )
 
-        render_explanation_chart(
-            result.get(
-                "analysis_text",
-                result["text"]
-            )
-        )
+        if st.button(
+            "Generate Explanation",
+            icon=":material/psychology:",
+            key="single_generate_explanation",
+            use_container_width=True
+        ):
+            with st.spinner("Generating explanation..."):
+                render_explanation_chart(
+                    result.get("analysis_text", result["text"])
+                )
 
     compact_divider()
 
@@ -3745,31 +3529,25 @@ def render_single_review():
             # DOWNLOAD EXPLAINABLE AI GRAPH
             # ------------------------------------------------
 
-            explanation_png = (
-                create_explanation_png(
-                    result.get(
-                        "analysis_text",
-                        result["text"]
-                    )
+            if st.button(
+                "Prepare Explainable AI Graph",
+                icon=":material/bar_chart:",
+                key="prepare_explanation_png",
+                use_container_width=True
+            ):
+                explanation_png = create_explanation_png(
+                    result.get("analysis_text", result["text"])
                 )
-            )
+                if explanation_png is not None:
+                    st.session_state.explanation_png = explanation_png
 
-            if explanation_png is not None:
-
+            if st.session_state.get("explanation_png"):
                 st.download_button(
-
                     "Download Explainable AI Graph",
-
-                    icon=":material/bar_chart:",
-
-                    data=explanation_png,
-
-                    file_name=(
-                        "explainable_ai_graph.png"
-                    ),
-
+                    icon=":material/download:",
+                    data=st.session_state.explanation_png,
+                    file_name="explainable_ai_graph.png",
                     mime="image/png",
-
                     use_container_width=True
                 )
 
@@ -3989,215 +3767,100 @@ def format_aspect_results(
 # CSV ANALYSIS
 # ============================================================
 
-def analyze_csv(
-    dataframe,
-    model_name
-):
-
-    review_column = (
-        detect_review_column(
-            dataframe
-        )
-    )
-
+def analyze_csv(dataframe, model_name):
+    review_column = detect_review_column(dataframe)
     if review_column is None:
+        return None, None
 
-        return (
-            None,
-            None
+    course_id_column, course_name_column = detect_course_columns(dataframe)
+    working = dataframe.copy()
+    working["__clean_review__"] = working[review_column].fillna("").astype(str).map(clean_text)
+    valid = working[working["__clean_review__"] != ""].copy()
+
+    if valid.empty:
+        return None, review_column
+
+    if len(valid) > CSV_MAX_ROWS:
+        st.warning(
+            f"This CSV contains {len(valid):,} non-empty reviews. "
+            f"For reliable CPU deployment, only the first {CSV_MAX_ROWS:,} reviews will be analyzed."
         )
+        valid = valid.head(CSV_MAX_ROWS).copy()
 
-    (
-        course_id_column,
-        course_name_column
-    ) = detect_course_columns(
-        dataframe
-    )
+    original_texts = valid["__clean_review__"].tolist()
 
-    # Prepare all reviews first so non-English feedback is
-    # translated locally in language batches rather than by
-    # repeatedly calling an external translation service.
-    review_indices = []
-    review_texts = []
+    # Translation is required for the English TF-IDF component and for the
+    # existing English aspect keyword system. DistilBERT itself does not need it.
+    need_english = model_name in {"Logistic Regression", "Combined"}
+    translation_results = None
 
-    for index, (_, source_row) in enumerate(
-        dataframe.iterrows()
-    ):
-
-        review = clean_text(
-            source_row[
-                review_column
-            ]
+    if need_english:
+        # Avoid loading NLLB for a completely English CSV.
+        language_results = translate_feedback_batch(original_texts, force=False)
+        any_non_english = any(
+            item["language"] not in {"en", "unknown"} for item in language_results
         )
+        if need_english and any_non_english:
+            try:
+                translation_results = translate_feedback_batch(original_texts, force=True)
+            except Exception as error:
+                st.error("Multilingual translation could not be completed.")
+                st.code(str(error))
+                return None, review_column
+        else:
+            translation_results = language_results
+    else:
+        translation_results = [
+            {
+                "original": text, "translated": text, "language": "en",
+                "language_name": "English", "was_translated": False
+            }
+            for text in original_texts
+        ]
 
-        if review:
+    analysis_texts = [item["translated"] for item in translation_results]
 
-            review_indices.append(index)
-            review_texts.append(review)
-
+    progress = st.progress(0)
+    progress.progress(0.15)
     try:
-
-        translation_results = (
-            translate_feedback_batch(
-                review_texts
-            )
-        )
-
+        predictions = predict_sentiment_batch(analysis_texts, model_name)
     except Exception as error:
-
-        st.error(
-            "Multilingual translation could not be completed."
-        )
-
-        st.code(
-            str(error)
-        )
-
-        return (
-            None,
-            review_column
-        )
-
-    translation_by_index = {
-        index: translation
-        for index, translation in zip(
-            review_indices,
-            translation_results
-        )
-    }
+        progress.empty()
+        st.error("Model prediction failed during CSV analysis.")
+        st.code(str(error))
+        return None, review_column
+    progress.progress(0.70)
 
     rows = []
-
-    total = len(
-        dataframe
-    )
-
-    progress = st.progress(
-        0
-    )
-
-    for index, (_, source_row) in enumerate(
-        dataframe.iterrows()
+    total = len(valid)
+    for position, ((_, source_row), translation, analysis_text, prediction) in enumerate(
+        zip(valid.iterrows(), translation_results, analysis_texts, predictions), start=1
     ):
-
-        review = clean_text(
-            source_row[
-                review_column
-            ]
-        )
-
-        if review:
-
-            try:
-
-                translation = (
-                    translation_by_index[index]
-                )
-
-                analysis_text = (
-                    translation["translated"]
-                )
-
-                prediction = (
-                    predict_sentiment(
-                        analysis_text,
-                        model_name
-                    )
-                )
-
-                aspect_results = (
-                    calculate_aspect_results(
-                        analysis_text
-                    )
-                )
-
-                rows.append({
-
-                    "Course":
-                        get_course_label(
-                            source_row,
-                            course_id_column,
-                            course_name_column
-                        ),
-
-                    "Review":
-                        review,
-
-                    "Language":
-                        translation[
-                            "language_name"
-                        ],
-
-                    "English Translation":
-                        analysis_text,
-
-                    "Sentiment":
-                        prediction[
-                            "label"
-                        ],
-
-                    "Confidence":
-                        prediction[
-                            "confidence"
-                        ],
-
-                    "Negative":
-                        prediction[
-                            "probabilities"
-                        ]["NEGATIVE"],
-
-                    "Neutral":
-                        prediction[
-                            "probabilities"
-                        ]["NEUTRAL"],
-
-                    "Positive":
-                        prediction[
-                            "probabilities"
-                        ]["POSITIVE"],
-
-                    "Detected Aspects":
-                        ", ".join(
-                            item["aspect"]
-                            for item in aspect_results
-                        ),
-
-                    "Aspect Analysis":
-                        format_aspect_results(
-                            aspect_results
-                        )
-                })
-
-            except Exception:
-
-                pass
-
-        if (
-            index % 5 == 0
-            or index == total - 1
-        ):
-
-            progress.progress(
-                (index + 1)
-                /
-                max(total, 1)
-            )
+        try:
+            # Keep aspect analysis, but perform it on translated English text.
+            aspect_results = calculate_aspect_results(analysis_text)
+            rows.append({
+                "Course": get_course_label(source_row, course_id_column, course_name_column),
+                "Review": source_row[review_column],
+                "Language": translation["language_name"],
+                "English Translation": analysis_text,
+                "Sentiment": prediction["label"],
+                "Confidence": prediction["confidence"],
+                "Negative": prediction["probabilities"]["NEGATIVE"],
+                "Neutral": prediction["probabilities"]["NEUTRAL"],
+                "Positive": prediction["probabilities"]["POSITIVE"],
+                "Detected Aspects": ", ".join(item["aspect"] for item in aspect_results),
+                "Aspect Analysis": format_aspect_results(aspect_results)
+            })
+        except Exception:
+            continue
+        if position % max(1, total // 10) == 0 or position == total:
+            progress.progress(0.70 + 0.30 * position / max(total, 1))
 
     progress.empty()
-
     if not rows:
-
-        return (
-            None,
-            review_column
-        )
-
-    return (
-        pd.DataFrame(
-            rows
-        ),
-        review_column
-    )
+        return None, review_column
+    return pd.DataFrame(rows), review_column
 
 
 # ============================================================
@@ -5093,9 +4756,15 @@ def render_csv_analysis():
             "Combined"
         ],
 
-        index=2,
+        index=0,
 
         horizontal=True
+    )
+
+    st.info(
+        "⚡ Performance tip: Logistic Regression is fastest. "
+        "DistilBERT uses batched inference; Combined runs both models. "
+        f"For Cloud deployment, files are limited to {CSV_MAX_ROWS:,} analyzed reviews."
     )
 
     if st.button(
@@ -5226,7 +4895,7 @@ def render_aspect_page():
 
             analysis_text, translation = (
                 prepare_feedback_for_analysis(
-                    text
+                    text, "Logistic Regression", translate_for_analysis=True
                 )
             )
 
@@ -5432,12 +5101,12 @@ def render_shap_page():
             return
 
         with st.spinner(
-            "Translating review and generating explanation..."
+            "Preparing the review and generating explanation..."
         ):
 
             analysis_text, translation = (
                 prepare_feedback_for_analysis(
-                    text
+                    text, "Logistic Regression", translate_for_analysis=True
                 )
             )
 
@@ -5838,8 +5507,8 @@ def render_about():
         )
 
         st.markdown(
-            "**2️⃣ Translate when needed:**  "
-            "Non-English feedback is detected and translated locally into English using a Hugging Face NLLB model before the existing analysis pipeline runs.",
+            "**2️⃣ Handle multilingual feedback:**  "
+            "Multilingual DistilBERT can analyze supported non-English feedback directly; NLLB translation is loaded only when an English-only analysis feature needs it.",
             unsafe_allow_html=True
         )
 
@@ -5964,6 +5633,12 @@ def render_footer():
 # ============================================================
 # RUN APPLICATION
 # ============================================================
+
+st.session_state.setdefault("single_result", None)
+st.session_state.setdefault("csv_results", None)
+st.session_state.setdefault("review_text", "")
+st.session_state.setdefault("active_page", "Single Review Analysis")
+st.session_state.setdefault("explanation_png", None)
 
 render_sidebar()
 
