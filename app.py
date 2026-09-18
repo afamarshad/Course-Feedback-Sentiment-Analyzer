@@ -87,10 +87,21 @@ TRANSLATION_MAX_OUTPUT_LENGTH = 128
 
 
 # ============================================================
-# MODEL PATHS
+# MODEL PATHS / HUGGING FACE CONFIGURATION
 # ============================================================
 
-DISTILBERT_MODEL_DIR = (
+# The fine-tuned DistilBERT model is stored on Hugging Face because
+# the model weights are too large for the GitHub repository.
+#
+# Local development:
+#   If ./coursera_multilingual_distilbert exists, the app uses it.
+#
+# Streamlit Community Cloud:
+#   The local folder is not required. The app automatically downloads
+#   the model from this Hugging Face repository.
+HF_DISTILBERT_REPO = "afamarshad/coursera-multilingual-distilbert"
+
+LOCAL_DISTILBERT_MODEL_DIR = (
     "./coursera_multilingual_distilbert"
 )
 
@@ -1214,40 +1225,62 @@ def normalize_label(value):
 @st.cache_resource(show_spinner=False)
 def load_models():
 
-    if not os.path.isdir(
-        DISTILBERT_MODEL_DIR
-    ):
+    # ------------------------------------------------------------
+    # 1. Find the DistilBERT model.
+    # ------------------------------------------------------------
+    #
+    # If the large model folder exists locally, use it.
+    # Otherwise, load the same model directly from Hugging Face.
+    #
+    # This makes the same app.py work both:
+    #   - locally in VS Code
+    #   - on Streamlit Community Cloud
+    #
+    if os.path.isdir(LOCAL_DISTILBERT_MODEL_DIR):
 
-        raise FileNotFoundError(
-            "DistilBERT model folder not found:\n"
-            f"{DISTILBERT_MODEL_DIR}"
+        distilbert_source = LOCAL_DISTILBERT_MODEL_DIR
+
+        st.info(
+            "Loading the multilingual DistilBERT model from the "
+            "local model folder..."
         )
 
-    if not os.path.isfile(
-        TFIDF_MODEL_FILE
-    ):
+    else:
 
-        raise FileNotFoundError(
-            "Logistic Regression model not found:\n"
-            f"{TFIDF_MODEL_FILE}"
+        distilbert_source = HF_DISTILBERT_REPO
+
+        st.info(
+            "Loading the multilingual DistilBERT model from "
+            f"Hugging Face: {HF_DISTILBERT_REPO}"
         )
 
-    if not os.path.isfile(
-        TFIDF_VECTORIZER_FILE
-    ):
+    # Optional Hugging Face token.
+    # The repository is public, so this can normally remain unset.
+    # If you later make the repository private, add HF_TOKEN to
+    # Streamlit Community Cloud Secrets.
+    hf_token = os.getenv("HF_TOKEN")
 
-        raise FileNotFoundError(
-            "TF-IDF vectorizer not found:\n"
-            f"{TFIDF_VECTORIZER_FILE}"
-        )
+    tokenizer_kwargs = {}
+
+    model_kwargs = {}
+
+    if hf_token and distilbert_source == HF_DISTILBERT_REPO:
+        tokenizer_kwargs["token"] = hf_token
+        model_kwargs["token"] = hf_token
+
+    # ------------------------------------------------------------
+    # 2. Load the fine-tuned multilingual DistilBERT model.
+    # ------------------------------------------------------------
 
     tokenizer = AutoTokenizer.from_pretrained(
-        DISTILBERT_MODEL_DIR
+        distilbert_source,
+        **tokenizer_kwargs
     )
 
     distilbert_model = (
         AutoModelForSequenceClassification.from_pretrained(
-            DISTILBERT_MODEL_DIR
+            distilbert_source,
+            **model_kwargs
         )
     )
 
@@ -1256,6 +1289,31 @@ def load_models():
     )
 
     distilbert_model.eval()
+
+    # ------------------------------------------------------------
+    # 3. Load the smaller TF-IDF + Logistic Regression model
+    #    and vectorizer from GitHub.
+    # ------------------------------------------------------------
+
+    if not os.path.isfile(
+        TFIDF_MODEL_FILE
+    ):
+
+        raise FileNotFoundError(
+            "Logistic Regression model not found:\n"
+            f"{TFIDF_MODEL_FILE}\n\n"
+            "Make sure this .pkl file is uploaded to GitHub."
+        )
+
+    if not os.path.isfile(
+        TFIDF_VECTORIZER_FILE
+    ):
+
+        raise FileNotFoundError(
+            "TF-IDF vectorizer not found:\n"
+            f"{TFIDF_VECTORIZER_FILE}\n\n"
+            "Make sure this .pkl file is uploaded to GitHub."
+        )
 
     tfidf_model = joblib.load(
         TFIDF_MODEL_FILE
@@ -1294,6 +1352,13 @@ except Exception as error:
 
     st.code(
         str(error)
+    )
+
+    st.warning(
+        "If this is running on Streamlit Community Cloud, make sure "
+        "the Hugging Face model repository is public and that the "
+        "GitHub repository contains the TF-IDF model and vectorizer "
+        ".pkl files."
     )
 
     st.stop()
