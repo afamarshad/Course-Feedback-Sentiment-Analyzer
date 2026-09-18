@@ -1219,149 +1219,116 @@ def normalize_label(value):
 
 
 # ============================================================
-# MODEL LOADING
+# LAZY MODEL LOADING
+# ============================================================
+#
+# Models are loaded only when a feature actually needs them.
+# This keeps the Streamlit page from waiting for DistilBERT during
+# the initial app startup.
+#
+# - TF-IDF + Logistic Regression loads when Logistic/Combined/
+#   Explainable AI features need it.
+# - Multilingual DistilBERT loads only when DistilBERT/Combined
+#   prediction is requested.
+# - NLLB translation is already lazy-loaded below and is only
+#   downloaded when a non-English review needs translation.
+#
+# Streamlit's st.cache_resource keeps each loaded model in memory
+# and reuses it across reruns/sessions of the app process.
 # ============================================================
 
+
+def _get_hf_token():
+    """Return an optional Hugging Face token for private repositories."""
+    try:
+        token = st.secrets.get("HF_TOKEN")
+        if token:
+            return token
+    except Exception:
+        pass
+
+    return os.getenv("HF_TOKEN")
+
+
 @st.cache_resource(show_spinner=False)
-def load_models():
+def load_distilbert_model():
+    """
+    Load the fine-tuned multilingual DistilBERT model only when
+    DistilBERT-based prediction is actually requested.
+    """
 
-    # ------------------------------------------------------------
-    # 1. Find the DistilBERT model.
-    # ------------------------------------------------------------
-    #
-    # If the large model folder exists locally, use it.
-    # Otherwise, load the same model directly from Hugging Face.
-    #
-    # This makes the same app.py work both:
-    #   - locally in VS Code
-    #   - on Streamlit Community Cloud
-    #
     if os.path.isdir(LOCAL_DISTILBERT_MODEL_DIR):
-
         distilbert_source = LOCAL_DISTILBERT_MODEL_DIR
-
-        st.info(
-            "Loading the multilingual DistilBERT model from the "
-            "local model folder..."
-        )
-
     else:
-
         distilbert_source = HF_DISTILBERT_REPO
 
-        st.info(
-            "Loading the multilingual DistilBERT model from "
-            f"Hugging Face: {HF_DISTILBERT_REPO}"
-        )
-
-    # Optional Hugging Face token.
-    # The repository is public, so this can normally remain unset.
-    # If you later make the repository private, add HF_TOKEN to
-    # Streamlit Community Cloud Secrets.
-    hf_token = os.getenv("HF_TOKEN")
+    hf_token = _get_hf_token()
 
     tokenizer_kwargs = {}
-
     model_kwargs = {}
 
     if hf_token and distilbert_source == HF_DISTILBERT_REPO:
         tokenizer_kwargs["token"] = hf_token
         model_kwargs["token"] = hf_token
 
-    # ------------------------------------------------------------
-    # 2. Load the fine-tuned multilingual DistilBERT model.
-    # ------------------------------------------------------------
+    try:
+        with st.spinner(
+            "Loading multilingual DistilBERT model for the first time..."
+        ):
+            model_tokenizer = AutoTokenizer.from_pretrained(
+                distilbert_source,
+                **tokenizer_kwargs
+            )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        distilbert_source,
-        **tokenizer_kwargs
-    )
+            model = AutoModelForSequenceClassification.from_pretrained(
+                distilbert_source,
+                **model_kwargs
+            )
 
-    distilbert_model = (
-        AutoModelForSequenceClassification.from_pretrained(
-            distilbert_source,
-            **model_kwargs
-        )
-    )
+        model.to(DEVICE)
+        model.eval()
 
-    distilbert_model.to(
-        DEVICE
-    )
+        return model_tokenizer, model
 
-    distilbert_model.eval()
+    except Exception as error:
+        raise RuntimeError(
+            "Unable to load the multilingual DistilBERT model.\n\n"
+            f"Source: {distilbert_source}\n"
+            f"Error: {error}"
+        ) from error
 
-    # ------------------------------------------------------------
-    # 3. Load the smaller TF-IDF + Logistic Regression model
-    #    and vectorizer from GitHub.
-    # ------------------------------------------------------------
 
-    if not os.path.isfile(
-        TFIDF_MODEL_FILE
-    ):
+@st.cache_resource(show_spinner=False)
+def load_tfidf_models():
+    """
+    Load the smaller TF-IDF + Logistic Regression resources only
+    when a feature actually needs them.
+    """
 
+    if not os.path.isfile(TFIDF_MODEL_FILE):
         raise FileNotFoundError(
             "Logistic Regression model not found:\n"
             f"{TFIDF_MODEL_FILE}\n\n"
             "Make sure this .pkl file is uploaded to GitHub."
         )
 
-    if not os.path.isfile(
-        TFIDF_VECTORIZER_FILE
-    ):
-
+    if not os.path.isfile(TFIDF_VECTORIZER_FILE):
         raise FileNotFoundError(
             "TF-IDF vectorizer not found:\n"
             f"{TFIDF_VECTORIZER_FILE}\n\n"
             "Make sure this .pkl file is uploaded to GitHub."
         )
 
-    tfidf_model = joblib.load(
-        TFIDF_MODEL_FILE
-    )
+    tfidf_model = joblib.load(TFIDF_MODEL_FILE)
+    tfidf_vectorizer = joblib.load(TFIDF_VECTORIZER_FILE)
 
-    tfidf_vectorizer = joblib.load(
-        TFIDF_VECTORIZER_FILE
-    )
-
-    return (
-        tokenizer,
-        distilbert_model,
-        tfidf_model,
-        tfidf_vectorizer
-    )
+    return tfidf_model, tfidf_vectorizer
 
 
-# ============================================================
-# LOAD MODELS
-# ============================================================
-
-try:
-
-    (
-        tokenizer,
-        distilbert_model,
-        tfidf_model,
-        tfidf_vectorizer
-    ) = load_models()
-
-except Exception as error:
-
-    st.error(
-        "Unable to load the trained models."
-    )
-
-    st.code(
-        str(error)
-    )
-
-    st.warning(
-        "If this is running on Streamlit Community Cloud, make sure "
-        "the Hugging Face model repository is public and that the "
-        "GitHub repository contains the TF-IDF model and vectorizer "
-        ".pkl files."
-    )
-
-    st.stop()
+def show_model_loading_error(error):
+    """Display a clear model-loading error without hiding the app UI."""
+    st.error("Unable to load the required trained model.")
+    st.code(str(error))
 
 
 # ============================================================
@@ -1375,7 +1342,9 @@ def predict_distilbert(text):
     if not text:
         return None
 
-    inputs = tokenizer(
+    model_tokenizer, model = load_distilbert_model()
+
+    inputs = model_tokenizer(
         [text],
         return_tensors="pt",
         padding=True,
@@ -1390,7 +1359,7 @@ def predict_distilbert(text):
 
     with torch.no_grad():
 
-        outputs = distilbert_model(
+        outputs = model(
             **inputs
         )
 
@@ -1460,6 +1429,8 @@ def predict_logistic(text):
 
     if not text:
         return None
+
+    tfidf_model, tfidf_vectorizer = load_tfidf_models()
 
     vector = (
         tfidf_vectorizer
@@ -3173,6 +3144,8 @@ def calculate_word_importance(
                 "value"
             ]
         )
+
+    tfidf_model, tfidf_vectorizer = load_tfidf_models()
 
     vector = (
         tfidf_vectorizer
